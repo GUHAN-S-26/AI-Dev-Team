@@ -1,0 +1,4 @@
+**
+!.dockerignore
+!docker/
+!docker/playwright.Dockerfile

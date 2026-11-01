@@ -1,0 +1,1 @@
+"""Structured monitoring read models."""

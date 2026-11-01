@@ -1,0 +1,599 @@
+AI DEV TEAM PROJECT DOCUMENTATION
+=================================
+
+Purpose
+-------
+
+This document explains the AI Dev Team project as implemented in the Python
+repository. It describes the architecture, workflow, primary agents, agent
+interaction model, file structure, persistence, security boundaries, and the
+way Docker is used for execution, testing, browser QA, and application
+preview.
+
+AI Dev Team is a local, policy-controlled software-development workspace. A
+user describes an application in natural language. The system turns that
+requirement into a validated architecture and implementation plan, asks for
+human approval, coordinates specialized agents in isolated Git worktrees,
+runs tests, merges approved changes, launches a restricted preview, and
+publishes QA and delivery artifacts.
+
+The project is written in Python 3.12+. It deliberately uses a custom
+orchestration layer instead of LangChain, CrewAI, AutoGen, Semantic Kernel,
+or another agent framework. Azure OpenAI is the only model-provider boundary.
+The model proposes plans, code changes, and tool calls; trusted Python
+services decide whether those proposals are valid and may be executed.
+
+
+1. Architectural overview
+-------------------------
+
+The system is divided into two broad parts:
+
+1. The control plane is the trusted Python application. It owns workflow
+   state, approvals, permissions, task scheduling, persistence, Git
+   operations, Docker invocation, QA coordination, and delivery.
+2. The agent layer contains model-driven workers. Agents receive bounded
+   context and can only propose structured outputs or allowlisted tool calls.
+   They do not directly access SQLite, the host shell, Docker, Git, or the
+   browser dashboard.
+
+The main dependency flow is:
+
+    User / CLI / Dashboard
+            |
+            v
+    Workspace API and Orchestrator
+            |
+            +--> SQLite repository, approvals, audit, memory, messages
+            |
+            v
+    Agent Runtime <--> Azure OpenAI
+            |
+            v
+    Tool Gateway
+            |
+            +--> Filesystem tools
+            +--> Git and worktree tools
+            +--> Docker sandbox tools
+            |
+            v
+    Isolated project worktrees
+            |
+            v
+    Integration -> final QA -> browser QA -> preview -> delivery artifacts
+
+The Orchestrator is deterministic control-plane code. It is not counted as an
+autonomous coding agent. The normal project team therefore contains four
+primary agents, with optional bounded sub-agents described below.
+
+
+2. Number of agents and responsibilities
+-----------------------------------------
+
+There are four primary agents per project:
+
+1. Planning Agent (role: planning)
+   - Reads the project requirement and creates the typed implementation plan.
+   - Defines functional and non-functional requirements, assumptions, risks,
+     architecture components, API contracts, folder structure, and tasks.
+   - Assigns each task only to planning, frontend, backend, or testing.
+   - Does not execute implementation tools or grant permissions.
+   - May read approved planning artifacts under docs/** and architecture/**.
+
+2. Frontend Agent (role: frontend)
+   - Implements the user interface and frontend assets.
+   - Works only on approved frontend tasks and contracts.
+   - Owns frontend and frontend/** in its worktree.
+   - Can read and write authorized files, search its workspace, run checks,
+     inspect diffs, and commit its changes.
+   - Must not modify backend files.
+
+3. Backend Agent (role: backend)
+   - Implements the server, APIs, backend behavior, and backend integrations.
+   - Works only on approved backend tasks and contracts.
+   - Owns backend and backend/** in its worktree.
+   - Uses the same controlled file, test, diff, and commit operations as the
+     Frontend Agent, but cannot modify frontend files.
+
+4. Testing Agent (role: testing)
+   - Independently creates and executes tests and reports defects with
+     reproducible evidence.
+   - Owns tests and tests/** in its worktree.
+   - May read authorized project files and create tests, but does not silently
+     change frontend or backend implementation source.
+   - Defects can be converted by the QA manager into repair tasks assigned to
+     the responsible implementation agent.
+
+The Planning Agent normally completes its planning task before development.
+After plan approval, Frontend, Backend, and Testing tasks can run concurrently
+when their dependencies allow it. The scheduler limits concurrency using the
+configured max_concurrency setting (four by default).
+
+Optional sub-agents are supported, but they are not an unrestricted fifth
+layer. A primary agent must request them through SubAgentManager. The manager
+checks that the parent is a primary agent, the role is allowlisted, the
+project and task match, and no more than three active sub-agents exist for one
+primary agent. A sub-agent cannot create another sub-agent. Its paths, tools,
+token limit, parent, task, and private memory namespace are persisted and
+controlled just like other agent metadata.
+
+Allowed sub-agent role examples include Requirement Analyst, System
+Architect, API Designer, Database Designer, UI Developer, API Developer,
+Security Developer, Unit Testing Agent, Integration Testing Agent, and
+Regression Testing Agent.
+
+
+3. How agents interact
+----------------------
+
+Agents do not call each other directly. Interaction is mediated by Python
+services and persisted state:
+
+1. The Orchestrator assigns tasks and controls state transitions.
+2. The ContextBuilder supplies the agent role, task, approved shared memory,
+   private memory, and a trust note stating that repository and tool output is
+   untrusted data rather than policy.
+3. AgentRuntime calls the Azure OpenAI client and validates structured model
+   output with Pydantic schemas.
+4. The model may return a plan, an AgentWorkResult, or function-tool
+   proposals. Tool proposals are not executed by AgentRuntime.
+5. ToolGateway validates each proposal against the agent's allowlist, task
+   paths, ownership patterns, locks, argument schemas, and sandbox policy.
+6. Successful tool calls and failures are stored in SQLite and written to the
+   audit log.
+7. MessageBus provides persisted, idempotent structured messages for events
+   such as task assignment, task completion, approval requests, bug reports,
+   contract updates, dependency blocks, and tool results.
+8. MemoryManager separates private agent memory from shared project memory.
+   Agents may write only their own private namespace. Shared memory writes
+   require Orchestrator mediation and are visible only when approved.
+
+The practical collaboration contract is therefore:
+
+    Planning Agent -> validated plan and contracts
+                    -> human approval
+    Frontend Agent  -> frontend branch/worktree commits
+    Backend Agent   -> backend branch/worktree commits
+    Testing Agent   -> tests, reports, and defect evidence
+                    -> repair tasks routed to Frontend or Backend
+    Orchestrator    -> validates, integrates, runs final QA, delivers
+
+The frontend and backend agents are isolated from one another during
+development. They coordinate through the approved plan, API contracts, task
+dependencies, persisted messages, and the eventual integration stage rather
+than by editing the same live directory.
+
+
+4. End-to-end project workflow
+------------------------------
+
+Step 1: Configure the Python application
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Settings are loaded from environment variables and an optional .env file.
+Important values include Azure OpenAI endpoint, API key, deployment,
+database/data paths, project/worktree roots, concurrency, token budgets,
+Docker image, dashboard settings, and Playwright image. Secrets remain in the
+trusted host process and are not copied into prompts, browser payloads,
+generated source, or execution containers.
+
+Step 2: Create a project
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The user creates a project through the CLI or authenticated dashboard with a
+name and requirement. Orchestrator.create_project:
+
+- Generates a PROJECT-* identifier.
+- Creates projects/<PROJECT_ID>/ as a Git repository with a main branch.
+- Creates the project record in SQLite.
+- Creates the four primary agent records.
+- Registers each agent's authorized path patterns and allowed tools.
+- Writes an audit event and CREATED checkpoint.
+
+Each project is isolated. Project membership, chat, tasks, memory, worktrees,
+preview sessions, QA output, and artifacts are scoped by project ID.
+
+Step 3: Generate and validate the plan
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Planning Agent receives the requirement through AgentRuntime. Azure
+OpenAI returns structured JSON, which is parsed into the Plan Pydantic model.
+The Orchestrator rejects a plan if it has no tasks, duplicate task IDs,
+unknown dependencies, dependency cycles, or no architecture components.
+
+The accepted plan is saved to SQLite and the project becomes
+AWAITING_APPROVAL. The plan includes requirements, architecture, technology
+choices, API contracts, folder structure, tasks, acceptance criteria, risks,
+assumptions, and open questions.
+
+Step 4: Human approval before implementation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Orchestrator creates an approve_plan approval record. The user reviews
+the plan in the dashboard or uses the CLI approval commands. No implementation
+stage begins until a reviewer or administrator explicitly approves it.
+
+On approval, the plan is copied into approved shared project memory, the plan
+tasks are persisted, planning tasks are finalized, and project status becomes
+DEVELOPMENT. A rejection ends that attempt and requires the user to provide
+new direction.
+
+Step 5: Build isolated worktrees
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Orchestrator creates three Git worktrees from main:
+
+- workspaces/<PROJECT_ID>/frontend on branch frontend
+- workspaces/<PROJECT_ID>/backend on branch backend
+- workspaces/<PROJECT_ID>/testing on branch testing
+
+The worktrees give Frontend, Backend, and Testing independent working
+directories. Agents cannot merge directly to main. Every commit path is
+checked by PermissionManager before staging.
+
+Step 6: Schedule dependency-aware tasks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+TaskManager validates task IDs, dependencies, ownership, and state changes.
+The allowed lifecycle is:
+
+    PENDING -> ASSIGNED -> IN_PROGRESS -> REVIEW -> COMPLETED
+
+Tasks can also become BLOCKED, FAILED, or CANCELLED according to the state
+machine. A task can enter IN_PROGRESS only when all dependencies are complete.
+Scheduler repeatedly selects ready tasks, sorts them deterministically, and
+runs ready tasks concurrently behind a bounded asyncio semaphore.
+
+Step 7: Execute agent work through the Tool Gateway
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For each task, Orchestrator creates a TaskExecution record and transitions the
+task to ASSIGNED and IN_PROGRESS. AgentRuntime asks Azure OpenAI for bounded
+tool proposals. Typical operations are read_file, list_directory,
+create_file, modify_file, search_workspace, run_formatter, run_tests,
+git_diff, and commit_changes.
+
+The Tool Gateway is the only route to side effects. It checks:
+
+- The requested tool is in the agent allowlist.
+- Arguments match the typed request schema and size limits.
+- Paths are relative, canonicalized, and contained in the worktree.
+- The path matches agent and task ownership patterns.
+- The path is not owned by another agent unless explicitly shared.
+- Locks and task scope are respected.
+- Commands run through the Docker sandbox rather than a host-shell fallback.
+
+An agent is considered complete only after its changes are committed. The
+Orchestrator can perform a bounded finalization commit for authorized changes,
+but it does not accept an uncommitted claim of completion.
+
+Step 8: Independent testing and repair cycles
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Testing Agent works in its own testing worktree and runs reproducible
+tests. It reports defects; it does not silently patch implementation source.
+QAManager can convert a BugReport into a REPAIR-* task assigned to the
+declared owner, with reproduction steps and regression acceptance criteria.
+The repair task re-enters the normal dependency-aware, permission-controlled
+workflow.
+
+Step 9: Integration approval
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When development tasks finish, Orchestrator validates each branch with Git
+status and git diff --check. It then creates a merge_to_main approval. A human
+must approve that action before IntegrationManager performs no-fast-forward
+merges of frontend, backend, and testing into the project's main repository.
+
+Step 10: Final Docker-backed QA
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After approved integration, project status becomes QA. TestRunner runs pytest
+against the integrated project inside the restricted Docker sandbox. The
+result is saved as a qa-report artifact. A passing report permits the workflow
+to continue; a failing report marks the project failed and can produce repair
+tasks.
+
+Step 11: Preview and browser QA
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a passing project, PreviewManager starts a project-specific container
+using a read-only project mount and a host-loopback-only published port. The
+dashboard uses an authenticated same-origin preview proxy so browser clients
+do not receive internal container details.
+
+PlaywrightRunner separately runs browser acceptance checks in the pinned
+Playwright image. It captures desktop, tablet, and mobile screenshots,
+component screenshots, traces, videos, HTML/JSON reports, console errors,
+failed requests, browser errors, broken images, and visual diffs. A first run
+creates an explicit BASELINE_CREATED result. Later image differences fail QA;
+visual changes are never silently approved.
+
+Step 12: Delivery
+~~~~~~~~~~~~~~~~~
+
+When QA and browser evidence pass, DeliveryManager writes
+data/artifacts/<PROJECT_ID>/final-report.json. The report contains the
+summary, delivered features, architecture summary, source references, build
+instructions, QA reports, known issues, security checks, outstanding
+approvals, and model-usage totals. The project then becomes COMPLETED.
+
+Step 13: Recovery
+~~~~~~~~~~~~~~~~~
+
+The Orchestrator checkpoints important stages: CREATED, PLAN_GENERATED,
+PLAN_APPROVED, DEVELOPMENT_COMPLETE, INTEGRATION_REVIEW, INTEGRATED,
+QA_COMPLETE, PLAYWRIGHT_QA_COMPLETE, and DELIVERY_GENERATED. If a process is
+interrupted, RecoveryManager loads the latest checkpoint, expires stale
+locks, identifies abandoned ASSIGNED/IN_PROGRESS/REVIEW tasks, and returns
+eligible unfinished work to a bounded retry path. It never fabricates task
+completion.
+
+
+5. Project and repository file structure
+-----------------------------------------
+
+The control-plane repository has this layout:
+
+    AI Dev Team/
+    |-- app/
+    |   |-- ai/
+    |   |   `-- azure_client.py       Azure-only model and tool-call boundary
+    |   |-- agents/
+    |   |   |-- base_agent.py         Agent definition and execution wrapper
+    |   |   |-- definitions.py        Four primary roles, tools, and paths
+    |   |   `-- sub_agent_manager.py  Bounded sub-agent lifecycle
+    |   |-- communication/
+    |   |   `-- message_bus.py        Persisted idempotent agent messages
+    |   |-- database/
+    |   |   |-- interfaces.py         Repository protocol/abstractions
+    |   |   `-- repository.py         SQLite persistence and migrations
+    |   |-- memory/
+    |   |   `-- memory_manager.py     Private and approved shared memory
+    |   |-- observability/
+    |   |   `-- monitor.py             Metrics and monitoring read models
+    |   |-- orchestrator/
+    |   |   |-- engine.py              Main lifecycle controller
+    |   |   |-- scheduler.py            Async dependency-aware scheduler
+    |   |   |-- integration_manager.py Approved Git merges
+    |   |   |-- recovery_manager.py    Checkpoints and recovery
+    |   |   `-- delivery.py             Final report publication
+    |   |-- qa/
+    |   |   |-- qa_manager.py           QA and repair-task coordination
+    |   |   |-- test_runner.py           Docker pytest runner
+    |   |   |-- playwright_runner.py     Isolated browser QA
+    |   |   |-- browser_worker.py        Browser worker executed in Docker
+    |   |   `-- visual_diff.py            Screenshot comparison
+    |   |-- runtime/
+    |   |   |-- agent_runtime.py         Context, model calls, usage limits
+    |   |   `-- context_builder.py       Bounded role-aware context
+    |   |-- schemas/
+    |   |   |-- models.py                Typed project/task/agent contracts
+    |   |   `-- tool_models.py            Typed file-operation requests
+    |   |-- security/
+    |   |   |-- auth.py                  Sessions and password handling
+    |   |   |-- permission_manager.py     Path, ownership, and lock checks
+    |   |   |-- approval_manager.py       Human approval records
+    |   |   `-- audit_logger.py           Security and workflow audit events
+    |   |-- tasks/
+    |   |   |-- state_machine.py          Valid task transitions
+    |   |   `-- task_manager.py            Dependencies and task persistence
+    |   |-- tools/
+    |   |   |-- tool_gateway.py            Only agent side-effect gateway
+    |   |   |-- filesystem.py              Confined file operations
+    |   |   |-- git_manager.py              Worktrees, diffs, commits
+    |   |   |-- workspace_manager.py        Project and worktree setup
+    |   |   `-- docker_manager.py           Restricted Docker execution
+    |   |-- web/
+    |   |   |-- dashboard.py                Authenticated local dashboard/API
+    |   |   |-- workspace.py                Chat and workflow job service
+    |   |   `-- preview.py                  Project preview container lifecycle
+    |   `-- main.py                          CLI entry point
+    |-- projects/
+    |   `-- <PROJECT_ID>/                    Integrated project Git repository
+    |-- workspaces/
+    |   `-- <PROJECT_ID>/
+    |       |-- frontend/                    Frontend Git worktree
+    |       |-- backend/                     Backend Git worktree
+    |       `-- testing/                     Testing Git worktree
+    |-- data/
+    |   |-- ai_dev_team.sqlite3              Source of truth for state
+    |   `-- artifacts/<PROJECT_ID>/           QA and delivery evidence
+    |-- docker/
+    |   |-- sandbox.Dockerfile                Restricted Python test image
+    |   `-- playwright.Dockerfile              Pinned browser QA image
+    |-- tests/                                Control-plane test suite
+    |-- PRD.md                                Product and security contract
+    |-- ARCHITECTURE.md                       Component/data-flow design
+    |-- SECURITY.md                           Security model
+    |-- API_DOCUMENTATION.md                  Local dashboard API
+    |-- QA_DOCUMENTATION.md                   QA evidence contract
+    |-- DEPLOYMENT.md                         Local deployment instructions
+    `-- pyproject.toml                        Packaging and quality settings
+
+Generated application repositories normally contain:
+
+    projects/<PROJECT_ID>/
+    |-- frontend/       UI source, for example frontend/index.html
+    |-- backend/        Server/API source, for example backend/server.py
+    `-- tests/          Unit, API, integration, and browser-facing tests
+
+The project repository is separate from app/, which is the platform's control
+plane. This separation prevents generated application code from becoming part
+of the orchestration runtime.
+
+SQLite stores projects, agents, private/shared memory, plans, tasks,
+dependencies, executions, messages, chat, approvals, ownership, locks, tool
+calls, audit events, checkpoints, artifacts, model usage, users, sessions,
+memberships, and preview sessions. The repository layer uses transactions and
+WAL mode and is the MVP source of truth.
+
+
+6. Docker usage in detail
+-------------------------
+
+Docker is invoked directly by trusted Python services through subprocess. The
+control plane itself normally runs on the host. Agents do not receive the
+Docker socket and cannot construct arbitrary Docker commands.
+
+6.1 Code-execution sandbox
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+DockerSandbox is used for agent checks and final pytest execution. Its default
+image is configured by AI_DEV_TEAM_DOCKER_IMAGE and the repository supplies a
+pinned image definition at docker/sandbox.Dockerfile. That image is based on
+python:3.12-slim and installs pytest 8.3.3, then runs as UID 65532.
+
+Each invocation is bounded and resembles:
+
+    docker run --rm \
+      --user 65532:<workspace-group> \
+      --cap-drop=ALL \
+      --security-opt=no-new-privileges \
+      --pids-limit 256 \
+      --cpus 2 \
+      --memory 1g \
+      --read-only \
+      --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+      --network=none \
+      -v <authorized-workspace>:/workspace:rw \
+      -w /workspace \
+      <image> <command>
+
+The workspace is the only writable project mount. The container has no network
+by default, a read-only root filesystem, dropped Linux capabilities,
+no-new-privileges, bounded process count, CPU, memory, output, and wall-clock
+time. If a task genuinely requires network access, the request must be
+explicitly approved; the default path rejects unapproved network access.
+There is no host-shell fallback when Docker is unavailable.
+
+6.2 Playwright browser QA image
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Browser QA uses a separate image because browser binaries and OS dependencies
+are different from the small code-execution image. Build it with:
+
+    docker build -f docker/playwright.Dockerfile \
+      -t ai-dev-team-playwright:1.55.0 .
+
+The Dockerfile starts from a pinned Microsoft Playwright image, installs the
+matching playwright==1.55.0 and pytest==8.3.3 packages, and adds only the
+runtime libraries needed to start the dashboard during acceptance tests:
+pydantic, openai, and Pillow. It runs as UID 65532.
+
+PlaywrightRunner mounts the project workspace, creates an ephemeral worker
+directory, starts the generated application with an argv-only command, waits
+for readiness, and runs the browser worker. It stores screenshots, traces,
+videos, reports, diagnostics, and visual diffs under the project's artifact
+directory. Browser execution is isolated from host credentials and uses the
+same restricted Docker execution policy.
+
+6.3 Project preview container
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+PreviewManager is separate from the test sandbox because a live browser needs
+a local HTTP endpoint. It starts one container per project with:
+
+- a read-only mount of projects/<PROJECT_ID>/ at /workspace;
+- non-root UID 65532 and the project group;
+- dropped capabilities and no-new-privileges;
+- bounded PIDs, CPU, memory, and a read-only root filesystem;
+- a small writable /tmp tmpfs;
+- no Docker socket;
+- an allowlist of preview executables: node, npm, pnpm, python, python3, uv,
+  and uvicorn;
+- a Docker-published port bound only to host 127.0.0.1.
+
+The preview container may use Docker bridge networking so the host can forward
+the local preview port, but the published endpoint remains loopback-only. The
+generated server binds to 0.0.0.0 inside the container when necessary for the
+container interface; this does not expose it publicly because Docker publishes
+only 127.0.0.1:<port> on the host. Preview status, port, command, errors, and
+container name are persisted in PreviewSession, while the browser receives a
+same-origin authenticated proxy URL rather than raw container details.
+
+When a preview is stopped or a project is deleted, the container is removed
+first, then project-scoped files and database records are cleaned up through
+confined paths and authorization checks.
+
+
+7. Security and control boundaries
+-----------------------------------
+
+The fundamental security rule is that model output is untrusted. This applies
+to Azure responses, repository files, user requirements, generated code,
+command output, browser output, and artifacts.
+
+- Pydantic schemas validate model responses, plans, tasks, tool arguments, and
+  API bodies.
+- PermissionManager canonicalizes paths and rejects traversal, symlink escape,
+  unauthorized ownership, and conflicting locks.
+- ToolGateway enforces per-agent allowlists and records every tool call.
+- Human approval is required for plan approval and merge-to-main approval.
+- Agents cannot merge directly to main or access the database.
+- Dashboard sessions use authentication, roles, CSRF protection, throttling,
+  and project membership checks.
+- Azure credentials remain in the trusted process and are not exposed to the
+  browser or containers.
+- Docker containers run non-root with constrained resources and no network by
+  default for code execution.
+- Preview ports are host-loopback-only.
+- Audit events record decisions, task transitions, tool calls, messages,
+  checkpoints, approvals, merges, and security-relevant denials.
+
+
+8. Running the project
+----------------------
+
+Typical local setup:
+
+    python3 -m venv .venv
+    . .venv/bin/activate
+    pip install -e '.[dev]'
+    cp .env.example .env
+
+Start the authenticated dashboard by setting an initial administrator and
+running:
+
+    export AI_DEV_TEAM_ADMIN_USERNAME=admin
+    export AI_DEV_TEAM_ADMIN_PASSWORD='use-a-local-password-at-least-12-characters'
+    python3 -m app.main dashboard
+
+The dashboard listens on 127.0.0.1:8080 by default. The CLI exposes the same
+major lifecycle stages:
+
+    ai-dev-team create "Example app" "Build a task tracker."
+    ai-dev-team plan PROJECT-...
+    ai-dev-team request-approval PROJECT-...
+    ai-dev-team decide APPROVAL-... reviewer approve
+    ai-dev-team run PROJECT-...
+    ai-dev-team request-integration PROJECT-...
+    ai-dev-team decide APPROVAL-... reviewer approve
+    ai-dev-team integrate PROJECT-...
+    ai-dev-team qa PROJECT-...
+    ai-dev-team browser-qa PROJECT-... --start-command python backend/server.py
+    ai-dev-team deliver PROJECT-...
+    ai-dev-team status PROJECT-...
+    ai-dev-team recover PROJECT-...
+
+The dashboard presents project chat, approval cards, agent activity, task
+progress, live preview, final application, QA results, screenshots, and build
+artifacts. Chat is project-scoped; a message changes only the selected
+project's context and persisted workflow.
+
+
+9. Summary
+----------
+
+AI Dev Team is best understood as a deterministic Python workflow engine with
+four bounded model-driven specialists. The Planning Agent defines the work;
+human approval authorizes it; Frontend, Backend, and Testing agents perform
+isolated tasks; the Tool Gateway and Docker enforce execution boundaries; the
+Orchestrator schedules and records everything; IntegrationManager merges only
+approved branches; QA and Playwright produce independent evidence; and
+DeliveryManager publishes the final report.
+
+This design keeps the useful flexibility of LLM reasoning while ensuring that
+workflow state, permissions, filesystem access, container execution, Git
+integration, approvals, and project isolation remain controlled by ordinary,
+auditable Python code.
